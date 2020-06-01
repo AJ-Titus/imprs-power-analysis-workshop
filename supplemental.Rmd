@@ -1,0 +1,488 @@
+---
+title: "Supplemental - Power analyses and simulations in R"
+author: "Andrew Jessop"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: 
+  html_document:
+    theme: united
+    highlight: haddock
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    number_sections: false
+    df_print: paged
+    self_contained: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{css, echo = FALSE}
+
+pre, code {white-space:pre !important; overflow-x:scroll !important}
+
+```
+
+```{r, include=FALSE}
+
+options(width=70)
+options(contrasts=c("contr.helmert","contr.poly")) 
+options(warn = -1)
+knitr::opts_chunk$set(echo=TRUE, tidy = TRUE, size="small", rows.print=20, dpi=300, comment = "")
+
+```
+
+# Setup
+
+```{r}
+
+# Load in packages needed to run the power analysis
+library(tidyverse)
+library(MASS)
+library(ggpubr)
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+
+# Set the seed number so that the results can be replicated
+set.seed(1)
+
+```
+
+
+# Pearson's Correlation
+
+We will build custom simulations of our experiments using published data. We will use open data from the Stanford Wordbank (retrieved on 21st May 2020 from http://wordbank.stanford.edu/analyses?name=vocab_norms) 
+
+```{r, fig.width = 10, fig.height = 5}
+
+# Load the data
+wordbank <- read.csv("data/vocabulary_norms_data.csv")
+vocab_norms <- wordbank %>%
+  group_by(age) %>%
+  summarise(mean=mean(vocab), sd=sd(vocab)) %>%
+  filter(age == 18)
+vocab_norms
+
+# Next we set the parameters for the simulating data
+samples <- 200
+alt_r <- 0.13
+alpha <- 0.05
+
+# Save the mean and variance of the vocabualary sizes (based on wordbank)
+vocab_mean <- 118
+vocab_sd <- 111
+vocab_scaled <- vocab_mean/vocab_sd
+
+# Save the mean and variance for reaction times (based on Peter et al. 2019)
+rt_mean <- 729.94
+rt_sd <- 348.18
+rt_scaled <- rt_mean/rt_sd
+
+# Simulate a data set
+data <- mvrnorm(n=samples, 
+                mu=c(vocab_scaled, rt_scaled),
+                Sigma=matrix(c(1, alt_r, alt_r, 1), nrow=2),
+                empirical=TRUE)
+head(data)
+
+# Covariance matrix
+cov(data)
+
+# Fit a Pearson's correlation
+cor(data[,1], data[,2]) 
+
+# Save the data in a tibble
+print(sim_df <- tibble(vocab=data[, 1]*vocab_sd, rt=data[, 2]*rt_sd))
+
+# Check the data has been simulated correctly
+sim_df %>% summarise(vocab_mean = mean(vocab),
+                     vocab_sd = sd(vocab),
+                     rt_mean = mean(rt),
+                     rt_sd = sd(rt))
+
+# Refit the Pearson's correlation with unscaled data
+cor.test(sim_df$vocab, sim_df$rt)
+
+# We need to allow for variance around the estimated true effect
+hist(rnorm(n=10000, mean=0.2, sd=0.07))
+
+# We need to repeat this process many times to estimate power
+n_experiments <- 1000
+
+# For this, we use a for loop and save the results to a simulation tibble
+sim_results <- tibble()
+
+# Start the simulation
+for(i in 1:n_experiments){
+  
+  # Correlation
+  r <- rnorm(n=1, mean=0.2, sd=0.07)
+  
+  # Simulate a new sample
+  data <- mvrnorm(n=samples, 
+                  mu=c(vocab_scaled, rt_scaled),
+                  Sigma=matrix(c(1, r, r, 1), nrow=2),
+                  empirical=TRUE)
+  
+  # Save the new sample
+  new_sample <- tibble(vocab=data[, 1]*vocab_sd, rt=data[, 2]*rt_sd)  
+  
+  # Compute the correlation
+  simulated_corr <- cor.test(new_sample$vocab, new_sample$rt)
+  
+  # Create a results data frame
+  results <- tibble(cor = simulated_corr$estimate,
+                    t = simulated_corr$statistic,
+                    df = simulated_corr$parameter,
+                    p = simulated_corr$p.value)
+  
+  # Save the results
+  sim_results <- rbind(sim_results, results)
+  
+}
+
+# Calculate the power levels
+power <- sum(sim_results$p < alpha)/n_experiments
+type_2 <- 1 - sum(sim_results$p < alpha)/n_experiments
+
+# Print the results
+paste0("When n = ", samples, ", power = ", power)
+
+# Check the simulation data frame
+sim_results
+
+# Calculate the critical R
+df <- unique(sim_results$df)
+critical_t <- qt(0.05/2, df, lower.tail = F)
+critical_r <- sqrt( (critical_t^2) / ( (critical_t^2) + df ) )
+paste0("When Pearson's R > ", round(critical_r, 3), ", we reject the null hypothesis")
+
+# Plot the results
+graph <- sim_results
+dens <- density(graph$cor)
+graph <- tibble(x = dens$x, y = dens$y) %>% 
+  mutate(variable = case_when(
+    (x <= critical_r) ~ "Off",
+    (x >= critical_r) ~ "On",
+    TRUE ~ NA_character_))
+p <- ggplot(graph, aes(x, y))
+p <- p + geom_line(colour="white")
+p <- p + xlab("Estimate") + ylab("Posterior Density")
+p <- p + geom_area(data = filter(graph, variable == 'Off'), fill = "#F04540")
+p <- p + geom_area(data = filter(graph, variable == 'On'), fill = "#0189FF")
+p <- p + theme_bw()
+p <- p + theme(plot.title = element_text(lineheight=.8, size=18, face = "bold"),
+               axis.title = element_text(size = 16, color="black", face="bold"),
+               axis.text = element_text(size = 16, color="black"),
+               panel.background = element_rect(colour = "black"),
+               panel.grid.major = element_blank(),
+               panel.grid.minor = element_blank())
+p <- p + ggtitle(paste0("r = ", alt_r, ", n = ", samples, ", alpha = ", alpha))
+p <- p + coord_cartesian(xlim=c(-0.1, 0.5))
+p
+
+```
+
+# Mixed Effects
+
+## Linear Regression
+
+```{r}
+
+# Save the mean and sd for reaction times at each age (based on Peter et al. 2019)
+rt_18_mean <- 729.94
+rt_18_sd <- 348.18
+rt_24_mean <- 675.73
+rt_24_sd <- 337.66
+rt_30_mean <- 639.14
+rt_30_sd <- 335.73
+
+# Next we set the parameters for the simulating data
+samples <- 100
+alpha <- 0.05
+
+# We need to repeat this process many times to estimate power
+n_experiments <- 100
+
+# For this, we use a for loop and save the results to a simulation tibble
+sim_results <- tibble()
+
+for (i in 1:n_experiments){
+  
+  # simulate a set of reaction times
+  sim_18 <- rnorm(n=samples, mean=rt_18_mean, sd=rt_18_sd)
+  sim_24 <- rnorm(n=samples, mean=rt_24_mean, sd=rt_24_sd)
+  sim_30 <- rnorm(n=samples, mean=rt_30_mean, sd=rt_30_sd)
+  
+  # Create a simulation data frame
+  sim_df <- tibble(subject = rep(1:samples, 3),
+                   age = c(rep(18, samples), rep(24, samples), rep(30, samples)),
+                   rt = c(sim_18, sim_24, sim_30)) 
+  
+  # Fit the regression model
+  sim_lm <- lm(rt ~ age, sim_df)
+  
+  # Create a results tibble
+  results <- tibble(beta = summary(sim_lm)$coefficients[2, 1],
+                    t = summary(sim_lm)$coefficients[2, 3],
+                    p = summary(sim_lm)$coefficients[2, 4])
+  
+  # Save the results
+  sim_results <- rbind(sim_results, results) 
+  
+}
+
+# Calculate the power levels
+power <- sum(sim_results$p < alpha)/n_experiments
+paste0("When n = ", samples, ", power = ", power)
+
+```
+
+## Find N for 80% power
+
+```{r}
+
+# Next we set the parameters for simulating data
+samples <- 210
+alpha <- 0.05
+
+# We need to repeat this process many times to estimate power
+n_experiments <- 100
+power <- 0
+
+# For this, we use a for loop and save the results to a simulation tibble
+
+while(power < 0.8){
+  
+  sim_results <- tibble()
+  
+  for (i in 1:n_experiments){
+    
+    # simulate a set of reaction times
+    sim_18 <- rnorm(n=samples, mean=rt_18_mean, sd=rt_18_sd)
+    sim_24 <- rnorm(n=samples, mean=rt_24_mean, sd=rt_24_sd)
+    sim_30 <- rnorm(n=samples, mean=rt_30_mean, sd=rt_30_sd)
+    
+    # Create a simulation data frame
+    sim_df <- tibble(subject = rep(1:samples, 3),
+                     age = c(rep(18, samples), rep(24, samples), rep(30, samples)),
+                     rt = c(sim_18, sim_24, sim_30)) 
+    
+    # Fit the regression model
+    sim_lm <- lm(rt ~ age, sim_df)
+    
+    # Create a results tibble
+    results <- tibble(beta = summary(sim_lm)$coefficients[2, 1],
+                      t = summary(sim_lm)$coefficients[2, 3],
+                      p = summary(sim_lm)$coefficients[2, 4])
+    
+    # Save the results
+    sim_results <- rbind(sim_results, results) 
+    
+  }
+  
+  power <- sum(sim_results$p < alpha)/n_experiments
+  samples <- samples + 1
+  print(paste0("When n = ", samples, ", power = ", power))
+  
+}
+
+# Calculate the power levels
+power <- sum(sim_results$p < alpha)/n_experiments
+paste0("When n = ", samples, ", power = ", power)
+
+```
+
+## Random effects for subject
+
+```{r}
+
+# Next we set the parameters for the simulating data
+n_experiments <- 100
+samples <- 214
+alpha <- 0.05
+
+# For this, we use a for loop and save the results to a simulation tibble
+sim_results <- tibble()
+
+# Calculate rt diferences
+diff_24 <- rt_18_mean - rt_24_mean
+diff_30 <- rt_24_mean - rt_30_mean
+
+# Start the simulation
+for(i in 1:n_experiments){
+  
+  # Use the differences to simulate a set of reaction times
+  sim_18 <- rnorm(n=samples, mean=rt_18_mean, sd=rt_18_sd)
+  sim_24 <- sim_18 - rnorm(n=samples, mean=diff_24, sd=rt_24_sd)
+  sim_30 <- sim_24 - rnorm(n=samples, mean=diff_30, sd=rt_30_sd)
+  
+  # Create a simulation data frame
+  sim_df <- tibble(subject = rep(1:samples, 3),
+                   age = c(rep(18, samples), rep(24, samples), rep(30, samples)),
+                   rt = c(sim_18, sim_24, sim_30)) 
+  
+  # Set subject as a factor
+  sim_df$subject <- factor(sim_df$subject)
+  
+  # Fit a maximal model
+  sim_lmer <- lmer(rt ~ age + (1 + age|subject), sim_df,
+                   control=lmerControl(optimizer = "nloptwrap", calc.derivs = FALSE),
+                   REML = FALSE)
+  
+  # Create a results tibble
+  results <- tibble(beta = summary(sim_lmer)$coefficients[2, 1],
+                    se = summary(sim_lmer)$coefficients[2, 2],
+                    t = summary(sim_lmer)$coefficients[2, 4],
+                    p = summary(sim_lmer)$coefficients[2, 5],
+                    r2m = r.squaredGLMM(sim_lmer)[1],
+                    r2c = r.squaredGLMM(sim_lmer)[2])
+  
+  # Save the results
+  sim_results <- rbind(sim_results, results)
+  
+}
+
+# Calculate the power levels
+power <- sum(sim_results$p < alpha)/n_experiments
+paste0("When n = ", samples, ", power = ", power)
+mean(sim_results$beta)
+
+```
+
+## Smaller effect size
+
+```{r}
+
+# Next we set the parameters for the simulating data
+n_experiments <- 100
+samples <- 214
+alpha <- 0.05
+
+# For this, we use a for loop and save the results to a simulation tibble
+sim_results <- tibble()
+
+# Start the simulation
+for(i in 1:n_experiments){
+  
+  # Use the differences to simulate a set of reaction times
+  sim_18 <- rnorm(n=samples, mean=720, sd=350)
+  sim_24 <- sim_18 - rnorm(n=samples, mean=25, sd=350)
+  sim_30 <- sim_24 - rnorm(n=samples, mean=25, sd=350)
+  
+  # Create a simulation data frame
+  sim_df <- tibble(subject = rep(1:samples, 3),
+                   age = c(rep(18, samples), rep(24, samples), rep(30, samples)),
+                   rt = c(sim_18, sim_24, sim_30)) 
+  
+  # Set subject as a factor
+  sim_df$subject <- factor(sim_df$subject)
+  
+  # Fit a maximal model
+  sim_lmer <- lmer(rt ~ age + (1 + age|subject), sim_df,
+                   control=lmerControl(optimizer = "nloptwrap", calc.derivs = FALSE),
+                   REML = FALSE)
+  summary(sim_lmer)
+  
+  # Create a results tibble
+  results <- tibble(beta = summary(sim_lmer)$coefficients[2, 1],
+                    se = summary(sim_lmer)$coefficients[2, 2],
+                    t = summary(sim_lmer)$coefficients[2, 4],
+                    p = summary(sim_lmer)$coefficients[2, 5],
+                    r2m = r.squaredGLMM(sim_lmer)[1],
+                    r2c = r.squaredGLMM(sim_lmer)[2])
+  
+  # Save the results
+  sim_results <- rbind(sim_results, results)
+  
+}
+
+# Calculate the power levels
+power <- sum(sim_results$p < alpha)/n_experiments
+paste0("When n = ", samples, ", power = ", power)
+
+```
+
+## Random effects for items
+
+```{r}
+
+# Set the parameters for simulating data
+n_experiments <- 100
+samples <- 200
+items <- 10
+presentations <- 3
+alpha <- 0.05
+
+# For this, we use a for loop and save the results to a simulation tibble
+sim_results <- tibble()
+
+# Calculate rt diferences
+diff_24 <- rt_18_mean - rt_24_mean
+diff_30 <- rt_24_mean - rt_30_mean
+
+# Start the simulation
+for(i in 1:n_experiments){
+  
+  # Use the differences to simulate a set of reaction times
+  sim_18 <- rnorm(n=samples, mean=rt_18_mean, sd=rt_18_sd)
+  sim_24 <- sim_18 - rnorm(n=samples, mean=diff_24, sd=rt_24_sd)
+  sim_30 <- sim_24 - rnorm(n=samples, mean=diff_30, sd=rt_30_sd)
+  
+  # Simulate subject RTs
+  sim_subs <- tibble(subject = rep(1:samples, 3),
+                     age = c(rep(18, samples), rep(24, samples), rep(30, samples)),
+                     sub_rt = c(sim_18, sim_24, sim_30)) 
+  
+  # Simulate item RTs
+  trial <- 1:(items*presentations)
+  item_id <- 1:items
+  item_rts <- rnorm(n=items, mean=0, sd=100)
+  sim_items <- tibble(trial=trial,
+                      item=rep(item_id, presentations),
+                      item_rt=rep(item_rts, presentations))
+  
+  # Create a  data frame
+  sim_df <- crossing(subject=sim_df$subject, trial=sim_items$trial)
+  sim_df <- tibble(merge(sim_df, sim_items, by=c("trial")))
+  sim_df <- tibble(merge(sim_df, sim_subs, by=c("subject")))
+  sim_df$rt <- sim_df$item_rt + sim_df$sub_rt
+  sim_df
+  
+  # Set subject and item as factors
+  sim_df$subject <- factor(sim_df$subject)
+  sim_df$item <- factor(sim_df$item)
+  
+  # Fit a maximal model
+  sim_lmer <- lmer(rt ~ age + (1 + age | subject) + (1 + age | item), sim_df,
+                   control=lmerControl(optimizer = "nloptwrap", calc.derivs = FALSE),
+                   REML = FALSE)
+  summary(sim_lmer)
+  
+  # Create a results tibble
+  results <- tibble(beta = summary(sim_lmer)$coefficients[2, 1],
+                    se = summary(sim_lmer)$coefficients[2, 2],
+                    t = summary(sim_lmer)$coefficients[2, 4],
+                    p = summary(sim_lmer)$coefficients[2, 5],
+                    r2m = r.squaredGLMM(sim_lmer)[1],
+                    r2c = r.squaredGLMM(sim_lmer)[2])
+  
+  # Save the results
+  sim_results <- rbind(sim_results, results)
+  
+}
+
+# Calculate the power levels
+power <- sum(sim_results$p < alpha)/n_experiments
+paste0("When n = ", samples, ", power = ", power)
+
+
+```
+
+# Appendix
+
+```{r}
+
+sessionInfo()
+
+```
